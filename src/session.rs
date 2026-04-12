@@ -270,6 +270,10 @@ impl Session {
         self.quality.get(peer).cloned()
     }
 
+    pub fn all_quality(&self) -> HashMap<PeerAddr, ConnectionQuality> {
+        self.quality.clone()
+    }
+
     pub async fn reconnect_peer(
         &mut self,
         peer_addr: SocketAddr,
