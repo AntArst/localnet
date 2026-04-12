@@ -177,6 +177,10 @@ impl Session {
         self.connected.len()
     }
 
+    pub fn connected_peers(&self) -> Vec<PeerAddr> {
+        self.connected.keys().cloned().collect()
+    }
+
     pub async fn accept_peer(&mut self) -> Result<PeerAddr> {
         let peer = self.transport.accept_peer().await?;
         let addr = PeerAddr(peer.addr.to_string());
