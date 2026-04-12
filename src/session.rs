@@ -87,6 +87,7 @@ impl Session {
         local_peer: PeerAddr,
         mode: SessionMode,
         player_name: &str,
+        metadata: HashMap<String, String>,
         capacity: u8,
     ) -> Result<Self> {
         let transport = QuinnTransport::bind(bind_addr)?;
@@ -97,6 +98,7 @@ impl Session {
             player_name,
             session_id.clone(),
             mode.as_str(),
+            &metadata,
             capacity,
             1,
             transport.local_addr()?.port(),

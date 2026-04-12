@@ -15,6 +15,7 @@ pub struct PeerInfo {
     pub display_name: String,
     pub session_id: SessionId,
     pub mode: String,
+    pub metadata: HashMap<String, String>,
     pub capacity: u8,
     pub current_players: u8,
     pub addr: SocketAddr,
@@ -99,6 +100,7 @@ impl PeerDiscovery {
         display_name: &str,
         session_id: SessionId,
         mode: &str,
+        metadata: &HashMap<String, String>,
         capacity: u8,
         current_players: u8,
         port: u16,
@@ -109,6 +111,13 @@ impl PeerDiscovery {
         properties.insert("display_name".to_string(), display_name.to_string());
         properties.insert("session_id".to_string(), session_id.0.to_string());
         properties.insert("mode".to_string(), mode.to_string());
+        let mut meta_keys = Vec::new();
+        for (key, value) in metadata {
+            let normalized = key.replace(',', "_");
+            meta_keys.push(normalized.clone());
+            properties.insert(format!("meta_{normalized}"), value.clone());
+        }
+        properties.insert("_meta_keys".to_string(), meta_keys.join(","));
         properties.insert("capacity".to_string(), capacity.to_string());
         properties.insert("players".to_string(), current_players.to_string());
         let cert_b64 = STANDARD.encode(cert_der);
@@ -189,6 +198,19 @@ fn peer_from_service(service: &ResolvedService) -> Option<PeerInfo> {
         .get_property_val_str("mode")
         .unwrap_or("traditional")
         .to_string();
+    let metadata = txt
+        .get_property_val_str("_meta_keys")
+        .map(|raw_keys| {
+            raw_keys
+                .split(',')
+                .filter(|key| !key.is_empty())
+                .filter_map(|key| {
+                    txt.get_property_val_str(&format!("meta_{key}"))
+                        .map(|val| (key.to_string(), val.to_string()))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let capacity = txt
         .get_property_val_str("capacity")
         .and_then(|v| v.parse::<u8>().ok())
@@ -204,6 +226,7 @@ fn peer_from_service(service: &ResolvedService) -> Option<PeerInfo> {
         display_name,
         session_id,
         mode,
+        metadata,
         capacity,
         current_players,
         addr: SocketAddr::new(ip, service.port),
