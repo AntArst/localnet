@@ -282,7 +282,7 @@ fn select_best_service_socket_addr(service: &ResolvedService) -> Option<SocketAd
 fn is_usable_remote_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_loopback(),
-        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_loopback(),
+        IpAddr::V6(_) => false, // Disable IPv6 to avoid unroutable link-local address freezes.
     }
 }
 

@@ -71,6 +71,10 @@ impl PtpClockConfig {
         };
         profile
     }
+
+    pub fn set_priority(&mut self, priority: u8) {
+        self.instance.priority_1 = priority;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,7 +129,12 @@ impl SoftwareClock {
     }
 
     pub fn new_unix() -> Self {
-        Self::new(Time::from_secs(0), default_time_properties())
+        let system_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let epoch = Time::from_secs(system_now.as_secs()) 
+            + Duration::from_nanos(system_now.subsec_nanos() as i64);
+        Self::new(epoch, default_time_properties())
     }
 
     pub fn snapshot(&self, discipline: ClockDiscipline) -> ClockSnapshot {
