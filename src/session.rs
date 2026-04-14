@@ -1,30 +1,14 @@
 use crate::{
-    ControlMessage, LocalnetSocket, PeerAddr, PeerDiscovery, PeerInfo, QuinnPeer, QuinnTransport,
-    SessionId,
+    ControlMessage, FlowDatagram, LocalnetSocket, MediaDatagram, PeerAddr, PeerDiscovery,
+    PeerInfo, QuinnPeer, QuinnTransport, QuinnTransportConfig, SessionId,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use tokio::sync::broadcast;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SessionMode {
-    Traditional,
-    Icebreaker,
-    Arcade,
-}
-
-impl SessionMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SessionMode::Traditional => "traditional",
-            SessionMode::Icebreaker => "icebreaker",
-            SessionMode::Arcade => "arcade",
-        }
-    }
-}
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -70,7 +54,6 @@ pub struct SessionHandle {
 
 pub struct Session {
     id: SessionId,
-    mode: SessionMode,
     status: SessionStatus,
     local_peer: PeerAddr,
     socket: LocalnetSocket,
@@ -78,26 +61,29 @@ pub struct Session {
     discovery: Option<PeerDiscovery>,
     connected: HashMap<PeerAddr, QuinnPeer>,
     quality: HashMap<PeerAddr, ConnectionQuality>,
+    incoming_datagrams: VecDeque<(PeerAddr, Vec<u8>)>,
+    incoming_flow_datagrams: VecDeque<(PeerAddr, FlowDatagram)>,
     events_tx: broadcast::Sender<SessionEvent>,
 }
 
 impl Session {
-    pub fn host(
+    pub fn host_with_transport_config(
         bind_addr: SocketAddr,
         local_peer: PeerAddr,
-        mode: SessionMode,
+        app_id: &str,
         player_name: &str,
         metadata: HashMap<String, String>,
         capacity: u8,
+        transport_config: QuinnTransportConfig,
     ) -> Result<Self> {
-        let transport = QuinnTransport::bind(bind_addr)?;
+        let transport = QuinnTransport::bind_with_config(bind_addr, app_id, transport_config)?;
         let mut discovery = PeerDiscovery::start()?;
         let session_id = SessionId::new();
         discovery.advertise(
             &local_peer.0,
             player_name,
             session_id.clone(),
-            mode.as_str(),
+            app_id,
             &metadata,
             capacity,
             1,
@@ -108,7 +94,6 @@ impl Session {
         let (events_tx, _) = broadcast::channel(256);
         let mut session = Self {
             id: session_id,
-            mode,
             status: SessionStatus::Created,
             local_peer,
             socket: LocalnetSocket::new(),
@@ -116,19 +101,46 @@ impl Session {
             discovery: Some(discovery),
             connected: HashMap::new(),
             quality: HashMap::new(),
+            incoming_datagrams: VecDeque::new(),
+            incoming_flow_datagrams: VecDeque::new(),
             events_tx,
         };
+        info!(app_id = %app_id, "hosting session");
         session.transition(SessionStatus::Lobby);
         Ok(session)
     }
 
-    pub fn join(bind_addr: SocketAddr, local_peer: PeerAddr, mode: SessionMode) -> Result<Self> {
-        let transport = QuinnTransport::bind(bind_addr)?;
+    pub fn host(
+        bind_addr: SocketAddr,
+        local_peer: PeerAddr,
+        app_id: &str,
+        player_name: &str,
+        metadata: HashMap<String, String>,
+        capacity: u8,
+    ) -> Result<Self> {
+        Self::host_with_transport_config(
+            bind_addr,
+            local_peer,
+            app_id,
+            player_name,
+            metadata,
+            capacity,
+            QuinnTransportConfig::default(),
+        )
+    }
+
+    pub fn join_with_transport_config(
+        bind_addr: SocketAddr,
+        local_peer: PeerAddr,
+        app_id: &str,
+        transport_config: QuinnTransportConfig,
+    ) -> Result<Self> {
+        let transport = QuinnTransport::bind_with_config(bind_addr, app_id, transport_config)?;
         let (events_tx, _) = broadcast::channel(256);
+        info!(app_id = %app_id, "joining session");
 
         Ok(Self {
             id: SessionId::new(),
-            mode,
             status: SessionStatus::Created,
             local_peer,
             socket: LocalnetSocket::new(),
@@ -136,12 +148,19 @@ impl Session {
             discovery: None,
             connected: HashMap::new(),
             quality: HashMap::new(),
+            incoming_datagrams: VecDeque::new(),
+            incoming_flow_datagrams: VecDeque::new(),
             events_tx,
         })
     }
 
-    pub fn mode(&self) -> SessionMode {
-        self.mode
+    pub fn join(bind_addr: SocketAddr, local_peer: PeerAddr, app_id: &str) -> Result<Self> {
+        Self::join_with_transport_config(
+            bind_addr,
+            local_peer,
+            app_id,
+            QuinnTransportConfig::default(),
+        )
     }
 
     pub fn status(&self) -> SessionStatus {
@@ -186,6 +205,7 @@ impl Session {
     pub async fn accept_peer(&mut self) -> Result<PeerAddr> {
         let peer = self.transport.accept_peer().await?;
         let addr = PeerAddr(peer.addr.to_string());
+        info!(peer = %addr.0, "peer accepted");
         self.connected.insert(addr.clone(), peer);
         self.transition(SessionStatus::Lobby);
         Ok(addr)
@@ -204,6 +224,7 @@ impl Session {
             .await
             .with_context(|| format!("failed connecting to host {host_addr}"))?;
         let addr = PeerAddr(peer.addr.to_string());
+        info!(host = %host_addr, "connected to host");
         self.connected.insert(addr.clone(), peer);
         self.transition(SessionStatus::Lobby);
         Ok(addr)
@@ -239,20 +260,41 @@ impl Session {
         Ok(())
     }
 
-    pub fn poll_datagrams(&self) -> Vec<(PeerAddr, Vec<u8>)> {
-        let mut messages = Vec::new();
-        for (peer_addr, peer) in &self.connected {
-            loop {
-                let Some(result) = peer.connection.read_datagram().now_or_never() else {
-                    break;
-                };
-                let Ok(bytes) = result else {
-                    break;
-                };
-                messages.push((peer_addr.clone(), bytes.to_vec()));
+    pub async fn send_flow_datagram_to_connected(&self, datagram: &FlowDatagram) -> Result<()> {
+        let encoded = datagram.encode_wire()?;
+        self.send_datagram_to_connected(&encoded).await
+    }
+
+    pub async fn send_media_datagram_to_connected(&self, datagram: &MediaDatagram) -> Result<()> {
+        let flow_datagram = datagram.into_flow_datagram()?;
+        self.send_flow_datagram_to_connected(&flow_datagram).await
+    }
+
+    pub fn poll_datagrams(&mut self) -> Vec<(PeerAddr, Vec<u8>)> {
+        self.ingest_pending_datagrams();
+        self.incoming_datagrams.drain(..).collect()
+    }
+
+    pub fn poll_flow_datagrams(&mut self) -> Vec<(PeerAddr, FlowDatagram)> {
+        self.ingest_pending_datagrams();
+        self.incoming_flow_datagrams.drain(..).collect()
+    }
+
+    pub fn poll_media_datagrams(&mut self) -> Result<Vec<(PeerAddr, MediaDatagram)>> {
+        self.ingest_pending_datagrams();
+
+        let mut media_datagrams = Vec::new();
+        let mut remaining = VecDeque::new();
+
+        while let Some((peer_addr, datagram)) = self.incoming_flow_datagrams.pop_front() {
+            match MediaDatagram::from_flow_datagram(&datagram)? {
+                Some(media) => media_datagrams.push((peer_addr, media)),
+                None => remaining.push_back((peer_addr, datagram)),
             }
         }
-        messages
+
+        self.incoming_flow_datagrams = remaining;
+        Ok(media_datagrams)
     }
 
     pub fn end_match(&mut self) {
@@ -288,6 +330,7 @@ impl Session {
             .await
             .with_context(|| format!("reconnect failed: {}", addr.0))?;
 
+        info!(peer = %addr.0, "peer reconnected");
         self.connected.insert(addr.clone(), peer);
         let _ = self
             .events_tx
@@ -305,16 +348,19 @@ impl Session {
             }
         }
 
-        // Pull one datagram per peer each frame to keep latency predictable.
-        for (peer_addr, peer) in &self.connected {
-            if let Ok(bytes) = peer.receive_datagram().await {
-                if let Ok((message, _)) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                {
-                    self.socket.enqueue_incoming(peer_addr.clone(), message);
-                }
-            }
+        // Update quality stats from Quinn for all connected peers
+        for (addr, peer) in &self.connected {
+            let stats = peer.stats();
+            let rtt_ms = stats.path.rtt.as_millis() as u32;
+            self.quality.insert(addr.clone(), ConnectionQuality {
+                rtt_ms,
+                jitter_ms: 0, // Quinn doesn't expose raw jitter easily
+                packet_loss: 0.0, // Could calculate from stats.path.lost_packets if needed
+            });
         }
+
+        // Non-blocking ingest of all pending datagrams
+        self.ingest_pending_datagrams();
         Ok(())
     }
 
@@ -322,14 +368,43 @@ impl Session {
         if self.connected.remove(peer).is_none() {
             return Err(anyhow!("peer {} was not connected", peer.0));
         }
+        info!(peer = %peer.0, "peer disconnected");
         self.quality.remove(peer);
         let _ = self.events_tx.send(SessionEvent::PeerLeft(peer.clone()));
         Ok(())
     }
 
     fn transition(&mut self, status: SessionStatus) {
+        debug!(from = ?self.status, to = ?status, "session status transition");
         self.status = status;
         let _ = self.events_tx.send(SessionEvent::StatusChanged(status));
+    }
+
+    fn ingest_pending_datagrams(&mut self) {
+        for (peer_addr, peer) in &self.connected {
+            loop {
+                let Some(result) = peer.connection.read_datagram().now_or_never() else {
+                    break;
+                };
+
+                let Ok(bytes) = result else {
+                    break;
+                };
+
+                match FlowDatagram::decode_wire(&bytes) {
+                    Ok(Some(flow_datagram)) => {
+                        self.incoming_flow_datagrams
+                            .push_back((peer_addr.clone(), flow_datagram));
+                    }
+                    Ok(None) => {
+                        self.incoming_datagrams.push_back((peer_addr.clone(), bytes.to_vec()));
+                    }
+                    Err(err) => {
+                        warn!(peer = %peer_addr.0, error = %err, "dropping malformed localnet flow datagram");
+                    }
+                }
+            }
+        }
     }
 }
 

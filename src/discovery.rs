@@ -1,5 +1,6 @@
 use crate::{SessionId, SERVICE_TYPE};
 use anyhow::Result;
+use tracing::{debug, info};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,6 @@ pub struct PeerInfo {
     pub peer_id: String,
     pub display_name: String,
     pub session_id: SessionId,
-    pub mode: String,
     pub metadata: HashMap<String, String>,
     pub capacity: u8,
     pub current_players: u8,
@@ -45,6 +45,7 @@ impl PeerDiscovery {
     pub fn start_with_service(service_type: &str) -> Result<Self> {
         let daemon = ServiceDaemon::new()?;
         let receiver = daemon.browse(service_type)?;
+        info!(service = %service_type, "mDNS discovery started");
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let (events_tx, _) = broadcast::channel(128);
 
@@ -55,6 +56,7 @@ impl PeerDiscovery {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         if let Some(peer) = peer_from_service(&info) {
+                            debug!(peer_id = %peer.peer_id, addr = %peer.addr, "mDNS peer discovered");
                             peers_clone
                                 .lock()
                                 .expect("discovery peers mutex poisoned")
@@ -76,6 +78,7 @@ impl PeerDiscovery {
                             match_id.and_then(|id| peers.remove(&id).map(|peer| peer.peer_id))
                         };
                         if let Some(peer_id) = maybe_removed_peer {
+                            debug!(peer_id = %peer_id, "mDNS peer lost");
                             let _ = events_clone.send(DiscoveryEvent::PeerLost(peer_id));
                         }
                     }
@@ -99,7 +102,7 @@ impl PeerDiscovery {
         peer_id: &str,
         display_name: &str,
         session_id: SessionId,
-        mode: &str,
+        app_id: &str,
         metadata: &HashMap<String, String>,
         capacity: u8,
         current_players: u8,
@@ -110,7 +113,6 @@ impl PeerDiscovery {
         properties.insert("peer_id".to_string(), peer_id.to_string());
         properties.insert("display_name".to_string(), display_name.to_string());
         properties.insert("session_id".to_string(), session_id.0.to_string());
-        properties.insert("mode".to_string(), mode.to_string());
         let mut meta_keys = Vec::new();
         for (key, value) in metadata {
             let normalized = key.replace(',', "_");
@@ -130,8 +132,11 @@ impl PeerDiscovery {
         for (index, chunk) in cert_chunks.iter().enumerate() {
             properties.insert(format!("cert_{index}"), chunk.clone());
         }
-        let host_name = format!("{peer_id}.local.");
-        let instance_name = format!("localpong-{peer_id}");
+        // DNS labels are limited to 63 bytes. Truncate peer_id-derived
+        // names so the mDNS daemon doesn't panic on long PeerAddr strings.
+        let truncated_id = if peer_id.len() > 53 { &peer_id[..53] } else { peer_id };
+        let host_name = format!("{truncated_id}.local.");
+        let instance_name = format!("{app_id}-{truncated_id}");
         let service = ServiceInfo::new(
             &self.service_type,
             &instance_name,
@@ -142,6 +147,7 @@ impl PeerDiscovery {
         )?
         .enable_addr_auto();
         self.registered_fullname = Some(service.get_fullname().to_string());
+        info!(app_id = %app_id, "advertising service on mDNS");
         self.daemon.register(service)?;
         Ok(())
     }
@@ -160,6 +166,7 @@ impl PeerDiscovery {
     }
 
     pub fn stop(&mut self) {
+        debug!("stopping mDNS discovery");
         if let Some(fullname) = self.registered_fullname.take() {
             if let Ok(rx) = self.daemon.unregister(&fullname) {
                 let _ = rx.recv();
@@ -182,9 +189,12 @@ impl Drop for PeerDiscovery {
 }
 
 fn peer_from_service(service: &ResolvedService) -> Option<PeerInfo> {
-    let ip = select_best_service_ip(service)
-        .or_else(|| service.host.parse::<IpAddr>().ok())
-        .filter(|ip| is_usable_remote_ip(*ip))?;
+    let addr = select_best_service_socket_addr(service)
+        .or_else(|| {
+            service.host.parse::<IpAddr>().ok()
+                .map(|ip| SocketAddr::new(ip, service.port))
+        })
+        .filter(|addr| is_usable_remote_ip(addr.ip()))?;
 
     let txt = &service.txt_properties;
     let peer_id = txt.get_property_val_str("peer_id")?.to_string();
@@ -194,10 +204,6 @@ fn peer_from_service(service: &ResolvedService) -> Option<PeerInfo> {
         .to_string();
     let session_raw = txt.get_property_val_str("session_id")?;
     let session_id = SessionId(session_raw.parse().ok()?);
-    let mode = txt
-        .get_property_val_str("mode")
-        .unwrap_or("traditional")
-        .to_string();
     let metadata = txt
         .get_property_val_str("_meta_keys")
         .map(|raw_keys| {
@@ -225,11 +231,10 @@ fn peer_from_service(service: &ResolvedService) -> Option<PeerInfo> {
         peer_id,
         display_name,
         session_id,
-        mode,
         metadata,
         capacity,
         current_players,
-        addr: SocketAddr::new(ip, service.port),
+        addr,
         cert_der,
     })
 }
@@ -253,25 +258,25 @@ fn decode_cert_from_txt(txt: &mdns_sd::TxtProperties) -> Option<Vec<u8>> {
         .and_then(|v| STANDARD.decode(v).ok())
 }
 
-fn scoped_ip_to_ip(ip: &ScopedIp) -> Option<IpAddr> {
+fn scoped_ip_to_socket_addr(ip: &ScopedIp, port: u16) -> Option<SocketAddr> {
     match ip {
-        ScopedIp::V4(v4) => Some(IpAddr::V4(*v4.addr())),
-        ScopedIp::V6(v6) => Some(IpAddr::V6(*v6.addr())),
+        ScopedIp::V4(v4) => Some(SocketAddr::new(IpAddr::V4(*v4.addr()), port)),
+        ScopedIp::V6(v6) => Some(SocketAddr::new(IpAddr::V6(*v6.addr()), port)),
         _ => None,
     }
 }
 
-fn select_best_service_ip(service: &ResolvedService) -> Option<IpAddr> {
-    let mut best_ip = None;
+fn select_best_service_socket_addr(service: &ResolvedService) -> Option<SocketAddr> {
+    let mut best_addr = None;
     let mut best_score = i32::MIN;
-    for ip in service.addresses.iter().filter_map(scoped_ip_to_ip) {
-        let score = ip_priority(ip);
+    for addr in service.addresses.iter().filter_map(|ip| scoped_ip_to_socket_addr(ip, service.port)) {
+        let score = ip_priority(addr.ip());
         if score > best_score {
             best_score = score;
-            best_ip = Some(ip);
+            best_addr = Some(addr);
         }
     }
-    best_ip
+    best_addr
 }
 
 fn is_usable_remote_ip(ip: IpAddr) -> bool {

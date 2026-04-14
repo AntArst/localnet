@@ -21,3 +21,7 @@ ggrs = "0.11"
 bytes = "1.10"
 bincode = { version = "2.0", features = ["serde"] }
 base64 = "0.22"
+fixed = "=1.29.0"
+rand = "0.8"
+socket2 = "0.6"
+statime = { version = "=0.4.0", features = ["std"] }
