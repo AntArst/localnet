@@ -1,16 +1,21 @@
 [package]
 name = "localnet"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Serverless LAN sessions: mDNS discovery, QUIC with pinned self-signed certificates, PTP clock sync and a GGRS socket adapter."
+repository = "https://github.com/AntArst/localnet"
+readme = "README.md"
+keywords = ["lan", "p2p", "quic", "mdns", "ggrs"]
+categories = ["network-programming", "game-development"]
 
 [dependencies]
-anyhow.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-uuid.workspace = true
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+tracing = "0.1"
+uuid = { version = "1.8", features = ["v4", "serde"] }
 mdns-sd = "0.19"
 quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
 rcgen = "0.14"

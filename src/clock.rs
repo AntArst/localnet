@@ -153,7 +153,6 @@ impl SoftwareClock {
             .lock()
             .expect("software clock lock poisoned")
             .properties
-            .clone()
     }
 
     pub fn current_time(&self) -> Time {
@@ -194,7 +193,7 @@ impl Clock for SoftwareClock {
 
     fn set_properties(&mut self, properties: &TimePropertiesDS) -> Result<(), Self::Error> {
         let mut state = self.inner.lock().map_err(|_| anyhow!("software clock lock poisoned"))?;
-        state.properties = properties.clone();
+        state.properties = *properties;
         Ok(())
     }
 }

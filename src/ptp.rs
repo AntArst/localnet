@@ -144,7 +144,7 @@ where
     R: Rng,
 {
     instance.add_port(
-        config.port.clone(),
+        config.port,
         DEFAULT_PTP_BASIC_FILTER_GAIN,
         clock,
         rng,
