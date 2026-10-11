@@ -4,7 +4,10 @@ use quinn::{
     congestion, ClientConfig, Connection, ConnectionStats, Endpoint, RecvStream, SendStream,
     ServerConfig, TransportConfig, VarInt,
 };
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::{aws_lc_rs, CryptoProvider};
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
@@ -237,6 +240,17 @@ impl Drop for QuinnTransport {
     }
 }
 
+/// The TLS crypto for every connection: aws-lc-rs, with the hybrid X25519MLKEM768 as
+/// the only key exchange. Session keys then hold unless both X25519 and ML-KEM-768
+/// fall, so traffic recorded today stays private against a future quantum computer.
+/// A peer that cannot do ML-KEM is refused at the handshake rather than quietly
+/// falling back to X25519 alone. Certificates and signatures are still classical.
+fn crypto_provider() -> Arc<CryptoProvider> {
+    let mut provider = aws_lc_rs::default_provider();
+    provider.kx_groups = vec![aws_lc_rs::kx_group::X25519MLKEM768];
+    Arc::new(provider)
+}
+
 fn make_server_config(
     app_id: &str,
     config: &QuinnTransportConfig,
@@ -249,8 +263,17 @@ fn make_server_config(
     let pkcs8 = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
     let key_der = PrivateKeyDer::from(pkcs8);
 
-    let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der)
-        .context("failed to create quinn server config")?;
+    // What quinn's `with_single_cert` builds, with our provider instead of the default.
+    let mut tls = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("TLS 1.3 unsupported by the crypto provider")?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .context("failed to create TLS server config")?;
+    tls.max_early_data_size = u32::MAX;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(tls).context("failed to create quinn server config")?,
+    ));
     server_config.transport_config(Arc::new(make_transport_config(config)));
     Ok((server_config, cert_der))
 }
@@ -263,8 +286,20 @@ fn make_client_config(
     root_store
         .add(remote_cert)
         .context("failed to add remote certificate to trust store")?;
-    let mut client_config = ClientConfig::with_root_certificates(Arc::new(root_store))
-        .context("failed to build QUIC client configuration")?;
+    // What quinn's `with_root_certificates` builds, with our provider instead of the
+    // default: the pinned certificate as the only root.
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), crypto_provider())
+        .build()
+        .context("failed to build certificate verifier")?;
+    let mut tls = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("TLS 1.3 unsupported by the crypto provider")?
+        .with_webpki_verifier(verifier)
+        .with_no_client_auth();
+    tls.enable_early_data = true;
+    let mut client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(tls).context("failed to build QUIC client configuration")?,
+    ));
     client_config.transport_config(Arc::new(make_transport_config(config)));
     Ok(client_config)
 }
