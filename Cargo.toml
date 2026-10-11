@@ -30,3 +30,41 @@ fixed = "=1.29.0"
 rand = "0.8"
 socket2 = "0.6"
 statime = { version = "=0.4.0", features = ["std"] }
+
+# Zero-knowledge lobby admission (src/admission.rs): Groth16 over BN254 with
+# Poseidon. Optional, so a game that does not gate its lobby builds none of it.
+ark-ff = { version = "0.5", default-features = false, optional = true }
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"], optional = true }
+ark-groth16 = { version = "0.5", default-features = false, optional = true }
+ark-snark = { version = "0.5", default-features = false, optional = true }
+ark-relations = { version = "0.5", default-features = false, optional = true }
+ark-r1cs-std = { version = "0.5", default-features = false, optional = true }
+ark-crypto-primitives = { version = "0.5", default-features = false, features = ["r1cs", "sponge"], optional = true }
+ark-serialize = { version = "0.5", default-features = false, optional = true }
+
+[features]
+admission = [
+    "dep:ark-ff",
+    "dep:ark-bn254",
+    "dep:ark-groth16",
+    "dep:ark-snark",
+    "dep:ark-relations",
+    "dep:ark-r1cs-std",
+    "dep:ark-crypto-primitives",
+    "dep:ark-serialize",
+]
+
+# Proving and setup are far too slow unoptimised, even in tests. arkworks is
+# generic, so most of it is compiled into this crate, not only into the
+# dependencies. Only applies when localnet itself is built, not to a game that
+# depends on it.
+[profile.dev]
+opt-level = 3
+
+[[test]]
+name = "admission"
+required-features = ["admission"]
+
+[[example]]
+name = "admission_bench"
+required-features = ["admission"]

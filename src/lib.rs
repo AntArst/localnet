@@ -1,3 +1,5 @@
+#[cfg(feature = "admission")]
+pub mod admission;
 pub mod clock;
 pub mod discovery;
 pub mod media;

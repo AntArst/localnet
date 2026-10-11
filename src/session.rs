@@ -408,6 +408,62 @@ impl Session {
     }
 }
 
+#[cfg(feature = "admission")]
+impl Session {
+    /// The certificate this session's endpoint presents, which clients pin. A host's
+    /// own seat is bound to it.
+    pub fn certificate_der(&self) -> Vec<u8> {
+        self.transport.certificate_der().to_vec()
+    }
+
+    /// Accepts the next peer only if it proves a seat: a credential in the group and a
+    /// nullifier no one in this match holds. A peer that fails is disconnected and never
+    /// joins the session. Every admitted peer is then sent the updated roster.
+    pub async fn accept_admitted_peer(
+        &mut self,
+        gate: &mut crate::admission::HostGate,
+    ) -> Result<PeerAddr> {
+        let peer = self.transport.accept_peer().await?;
+        let addr = PeerAddr(peer.addr.to_string());
+        if let Err(err) = gate.admit(&peer).await {
+            warn!(peer = %addr.0, error = %err, "peer refused a seat");
+            peer.connection.close(0u32.into(), b"admission refused");
+            return Err(err);
+        }
+        info!(peer = %addr.0, "peer admitted");
+        self.connected.insert(addr.clone(), peer);
+        self.transition(SessionStatus::Lobby);
+        for peer in self.connected.values() {
+            crate::admission::send_roster(peer, gate.roster()).await?;
+        }
+        Ok(addr)
+    }
+
+    /// The client's side: proves a seat on the connection to the host, and on
+    /// admission returns its nullifier and the first roster, already checked.
+    pub async fn request_admission(
+        &self,
+        host: &PeerAddr,
+        host_cert_der: &[u8],
+        keys: &crate::admission::AdmissionKeys,
+        credential: &crate::admission::Credential,
+        root: crate::admission::Root,
+        scope: crate::admission::Scope,
+    ) -> Result<(crate::admission::Nullifier, crate::admission::Roster)> {
+        let peer = self
+            .connected
+            .get(host)
+            .ok_or_else(|| anyhow!("not connected to host {}", host.0))?;
+        let (_, nullifier) =
+            crate::admission::request_admission(peer, keys, credential, root, scope).await?;
+        let roster = crate::admission::receive_roster(peer).await?;
+        keys.verifier()
+            .verify_roster(&root, &scope, host_cert_der, &nullifier, &roster)
+            .map_err(|e| anyhow!("the host's roster does not check out: {e}"))?;
+        Ok((nullifier, roster))
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if let Some(discovery) = self.discovery.as_mut() {

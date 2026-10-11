@@ -33,6 +33,29 @@ The two tests in `tests/pinning.rs` show the model directly over loopback: a
 client that pins the host's certificate connects and exchanges datagrams, and a
 client that pins any other certificate is refused during the TLS handshake.
 
+## Lobby admission (optional)
+
+With the `admission` feature, a host can seat only players who prove in zero
+knowledge that they hold a credential from a known group, at most one seat per
+credential per match, without revealing which credential. It is Semaphore's
+construction (Groth16 over BN254, Poseidon), and the classical baseline for
+[oneSeat](https://micronant.com/oneseat/).
+
+- Each proof is bound to the TLS exporter value of its own QUIC connection, so
+  it cannot be replayed on another.
+- The host proves its own seat, bound to the certificate clients pin, and sends
+  every client the roster of seats; clients check every proof in it.
+- `AdmissionKeys::setup` runs the Groth16 setup locally. Whoever runs it can
+  forge proofs, so it suits a prototype; a real deployment needs a ceremony.
+
+`Session::accept_admitted_peer` and `Session::request_admission` wire it into a
+session; `tests/admission.rs` covers it end to end over loopback.
+
+```sh
+cargo test --features admission
+cargo run --release --features admission --example admission_bench
+```
+
 ## Usage
 
 Hosting advertises the session and waits for players:
