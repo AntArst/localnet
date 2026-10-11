@@ -13,7 +13,7 @@ LAN Pong for Android and desktop, and extracted here as its own crate.
 | Module | |
 |---|---|
 | `discovery` | Advertises a session over mDNS and browses for others. Each host's self-signed certificate travels in the service's TXT record, split into base64 chunks. |
-| `transport` | QUIC (`quinn`) with TLS 1.3 (`rustls`). A host generates a certificate per session with `rcgen`; a client trusts exactly that certificate and nothing else. Datagrams for game traffic, streams when needed. |
+| `transport` | QUIC (`quinn`) with TLS 1.3 (`rustls`). Key exchange is the hybrid post-quantum X25519MLKEM768 only, through aws-lc-rs; a peer that offers only classical X25519 is refused. A host generates a certificate per session with `rcgen`; a client trusts exactly that certificate and nothing else. Datagrams for game traffic, streams when needed. |
 | `session` | Host or join, a lobby → starting → in-progress lifecycle, per-peer connection quality, and events for peers joining, leaving and reconnecting. |
 | `socket` | `LocalnetSocket`, an implementation of GGRS's `NonBlockingSocket`, so a rollback session runs over the QUIC connection without the game touching the transport. |
 | `clock`, `ptp`, `ptp_udp` | A software clock disciplined by PTP (IEEE 1588) over UDP, using [`statime`](https://github.com/pendulum-project/statime). localPong uses it to keep background music in sync on every device. |
